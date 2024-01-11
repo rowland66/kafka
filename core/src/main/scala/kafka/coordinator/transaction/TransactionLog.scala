@@ -83,7 +83,7 @@ object TransactionLog {
 
     // Serialize with the highest supported non-flexible version
     // until a tagged field is introduced or the version is bumped.
-    MessageUtil.toVersionPrefixedBytes(0,
+    MessageUtil.toVersionPrefixedBytes(2,
       new TransactionLogValue()
         .setProducerId(txnMetadata.producerId)
         .setProducerEpoch(txnMetadata.producerEpoch)
@@ -91,7 +91,8 @@ object TransactionLog {
         .setTransactionStatus(txnMetadata.txnState.id)
         .setTransactionLastUpdateTimestampMs(txnMetadata.txnLastUpdateTimestamp)
         .setTransactionStartTimestampMs(txnMetadata.txnStartTimestamp)
-        .setTransactionPartitions(transactionPartitions))
+        .setTransactionPartitions(transactionPartitions)
+        .setIsExternalTransaction(if (txnMetadata.isExternal) 1 else 0))
   }
 
   /**
@@ -134,7 +135,8 @@ object TransactionLog {
           state = TransactionState.fromId(value.transactionStatus),
           topicPartitions = mutable.Set.empty[TopicPartition],
           txnStartTimestamp = value.transactionStartTimestampMs,
-          txnLastUpdateTimestamp = value.transactionLastUpdateTimestampMs)
+          txnLastUpdateTimestamp = value.transactionLastUpdateTimestampMs,
+          isExternal = if (value.isExternalTransaction > 0) true else false)
 
         if (!transactionMetadata.state.equals(Empty))
           value.transactionPartitions.forEach(partitionsSchema =>
@@ -184,6 +186,7 @@ object TransactionLog {
           case Some(txnMetadata) => s"producerId:${txnMetadata.producerId}," +
             s"producerEpoch:${txnMetadata.producerEpoch}," +
             s"state=${txnMetadata.state}," +
+            s"isExternal=${txnMetadata.isExternal}, " +
             s"partitions=${txnMetadata.topicPartitions.mkString("[", ",", "]")}," +
             s"txnLastUpdateTimestamp=${txnMetadata.txnLastUpdateTimestamp}," +
             s"txnTimeoutMs=${txnMetadata.txnTimeoutMs}"

@@ -498,6 +498,7 @@ class TransactionMetadataTest {
       case CompleteAbort => assertTrue(unmatchedStates.remove(CompleteAbort))
       case PrepareEpochFence => assertTrue(unmatchedStates.remove(PrepareEpochFence))
       case Dead => assertTrue(unmatchedStates.remove(Dead))
+      case Prepared => assertTrue(unmatchedStates.remove(Prepared))
     }
 
     assertEquals(Set.empty, unmatchedStates)

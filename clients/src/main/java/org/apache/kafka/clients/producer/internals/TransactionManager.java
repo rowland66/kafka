@@ -41,11 +41,11 @@ import org.apache.kafka.common.errors.TransactionalIdAuthorizationException;
 import org.apache.kafka.common.errors.UnknownProducerIdException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
-import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
 import org.apache.kafka.common.message.EndTxnRequestData;
-import org.apache.kafka.common.message.FindCoordinatorRequestData;
-import org.apache.kafka.common.message.FindCoordinatorResponseData.Coordinator;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
+import org.apache.kafka.common.message.FindCoordinatorRequestData;
+import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
+import org.apache.kafka.common.message.FindCoordinatorResponseData.Coordinator;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.RecordBatch;
@@ -83,6 +83,7 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
@@ -92,7 +93,7 @@ public class TransactionManager {
     private static final int NO_INFLIGHT_REQUEST_CORRELATION_ID = -1;
 
     private final Logger log;
-    private final String transactionalId;
+    private String transactionalId;
     private final int transactionTimeoutMs;
     private final ApiVersions apiVersions;
 
@@ -201,7 +202,8 @@ public class TransactionManager {
         COMMITTING_TRANSACTION,
         ABORTING_TRANSACTION,
         ABORTABLE_ERROR,
-        FATAL_ERROR;
+        FATAL_ERROR,
+        NO_CHANGE;
 
         private boolean isTransitionValid(State source, State target) {
             switch (target) {
@@ -220,6 +222,7 @@ public class TransactionManager {
                 case ABORTABLE_ERROR:
                     return source == IN_TRANSACTION || source == COMMITTING_TRANSACTION || source == ABORTABLE_ERROR
                             || source == INITIALIZING;
+                case NO_CHANGE:
                 case FATAL_ERROR:
                 default:
                     // We can transition to FATAL_ERROR unconditionally.
@@ -280,10 +283,13 @@ public class TransactionManager {
         return initializeTransactions(ProducerIdAndEpoch.NONE);
     }
 
+    public synchronized TransactionalRequestResult initializeWithExternalTransaction(long producerId) {
+        return initializeTransactions(new ProducerIdAndEpoch(producerId, (short) -2));
+    }
     synchronized TransactionalRequestResult initializeTransactions(ProducerIdAndEpoch producerIdAndEpoch) {
         maybeFailWithError();
 
-        boolean isEpochBump = producerIdAndEpoch != ProducerIdAndEpoch.NONE;
+        boolean isEpochBump = producerIdAndEpoch != ProducerIdAndEpoch.NONE && producerIdAndEpoch.epoch != -2;
         return handleCachedTransactionRequestResult(() -> {
             // If this is an epoch bump, we will transition the state as part of handling the EndTxnRequest
             if (!isEpochBump) {
@@ -416,6 +422,10 @@ public class TransactionManager {
         return transactionalId;
     }
 
+    public void setTransactionalId(String transactionalId) {
+        this.transactionalId = transactionalId;
+    }
+
     public boolean hasProducerId() {
         return producerIdAndEpoch.isValid();
     }
@@ -496,9 +506,10 @@ public class TransactionManager {
     }
 
     /**
-     * Set the producer id and epoch atomically.
+     * Set the producer id and epoch atomically. Exposed publicly so that the XAProducer can set the producer id based
+     * on the external txn id.
      */
-    private void setProducerIdAndEpoch(ProducerIdAndEpoch producerIdAndEpoch) {
+    public void setProducerIdAndEpoch(ProducerIdAndEpoch producerIdAndEpoch) {
         log.info("ProducerId set to {} with epoch {}", producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);
         this.producerIdAndEpoch = producerIdAndEpoch;
     }
@@ -784,7 +795,7 @@ public class TransactionManager {
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
-        if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
+        if ((nextRequestHandler.isEndTxn() || nextRequestHandler.isPrepareTxn()) && hasIncompleteBatches)
             return null;
 
         pendingRequests.poll();
@@ -794,7 +805,7 @@ public class TransactionManager {
             return null;
         }
 
-        if (nextRequestHandler.isEndTxn() && !transactionStarted) {
+        if ((nextRequestHandler.isEndTxn() || nextRequestHandler.isPrepareTxn()) && !transactionStarted) {
             nextRequestHandler.result.done();
             if (currentState != State.FATAL_ERROR) {
                 log.debug("Not sending EndTxn for completed transaction since no partitions " +
@@ -1230,7 +1241,7 @@ public class TransactionManager {
                 } else if (response.versionMismatch() != null) {
                     fatalError(response.versionMismatch());
                 } else if (response.hasResponse()) {
-                    log.trace("Received transactional response {} for request {}", response.responseBody(),
+                    log.info("Received transactional response {} for request {}", response.responseBody(),
                             requestBuilder());
                     synchronized (TransactionManager.this) {
                         handleResponse(response.responseBody());
@@ -1259,6 +1270,10 @@ public class TransactionManager {
 
         boolean isRetry() {
             return isRetry;
+        }
+
+        boolean isPrepareTxn() {
+            return false;
         }
 
         boolean isEndTxn() {
@@ -1731,5 +1746,54 @@ public class TransactionManager {
         }
     }
 
+    public static class TransactionManagerReference {
+        volatile TransactionManager reference;
 
+        private final ReentrantLock accessLock;
+
+        public TransactionManagerReference(TransactionManager tm) {
+            reference = tm;
+            accessLock = new ReentrantLock();
+        }
+
+        public void set(TransactionManager tm) {
+            accessLock.lock();
+            reference = tm;
+            accessLock.unlock();
+        }
+
+        public void clear() {
+            accessLock.lock();
+            reference = null;
+            accessLock.unlock();
+        }
+
+        public TransactionManager get() {
+            if (reference == null) {
+                throw new RuntimeException("Unexpected producer with no TransactionManager");
+            }
+            return reference;
+        }
+
+        public boolean isAvailable() {
+            return reference != null;
+        }
+
+        /**
+         * Execute the Runnable if a referenced TransactionManager is available.
+         *
+         * @param s
+         */
+        public boolean withTransactionManager(Supplier<Boolean> s) {
+            accessLock.lock();
+            try {
+                if (!isAvailable()) {
+                    return false;
+                }
+                return s.get();
+            } finally {
+                accessLock.unlock();
+            }
+        }
+    }
 }

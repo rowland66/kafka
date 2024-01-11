@@ -25,6 +25,8 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.clients.producer.XAKafkaProducer;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.AuthorizationException;
@@ -40,6 +42,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 
 import static java.time.Duration.ofMillis;
 import static java.util.Collections.emptyList;
@@ -48,7 +51,7 @@ import static java.util.Collections.singleton;
 /**
  * This class implements a read-process-write application.
  */
-public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebalanceListener, AutoCloseable {
+public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebalanceListener {
     private final String bootstrapServers;
     private final String inputTopic;
     private final String outputTopic;
@@ -56,9 +59,6 @@ public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebal
     private final CountDownLatch latch;
     private final String transactionalId;
     private volatile boolean closed;
-
-    private final KafkaProducer<Integer, String> producer;
-    private final KafkaConsumer<Integer, String> consumer;
 
     public ExactlyOnceMessageProcessor(String threadName,
                                        String bootstrapServers,
@@ -72,32 +72,10 @@ public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebal
         this.transactionalId = "tid-" + threadName;
         // It is recommended to have a relatively short txn timeout in order to clear pending offsets faster.
         int transactionTimeoutMs = 10_000;
-        // A unique transactional.id must be provided in order to properly use EOS.
-        producer = new Producer(
-                "processor-producer",
-                KafkaProperties.BOOTSTRAP_SERVERS,
-                outputTopic,
-                true,
-                transactionalId,
-                true,
-                -1,
-                transactionTimeoutMs,
-                null)
-                .createKafkaProducer();
         // Consumer must be in read_committed mode, which means it won't be able to read uncommitted data.
         // Consumer could optionally configure groupInstanceId to avoid unnecessary rebalances.
         this.groupInstanceId = "giid-" + threadName;
         boolean readCommitted = true;
-        consumer = new Consumer(
-                "processor-consumer",
-                KafkaProperties.BOOTSTRAP_SERVERS,
-                inputTopic,
-                "processor-group",
-                Optional.of(groupInstanceId),
-                readCommitted,
-                -1,
-                null)
-                .createKafkaConsumer();
         this.latch = latch;
     }
 
@@ -106,16 +84,25 @@ public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebal
         int processedRecords = 0;
         long remainingRecords = Long.MAX_VALUE;
         // it is recommended to have a relatively short txn timeout in order to clear pending offsets faster
-        int transactionTimeoutMs = 10_000;
+        int transactionTimeoutMs = 300_000;
         // consumer must be in read_committed mode, which means it won't be able to read uncommitted data
         boolean readCommitted = true;
-        try (KafkaProducer<Integer, String> producer = new Producer("processor-producer", bootstrapServers, outputTopic,
+        try (XAKafkaProducer<Integer, String> producer = new Producer("processor-producer", bootstrapServers, outputTopic,
                 true, transactionalId, true, -1, transactionTimeoutMs, null).createKafkaProducer();
              KafkaConsumer<Integer, String> consumer = new Consumer("processor-consumer", bootstrapServers, inputTopic,
                  "processor-group", Optional.of(groupInstanceId), readCommitted, -1, null).createKafkaConsumer()) {
             // called first and once to fence zombies and abort any pending transaction
-            producer.initTransactions();
+            byte[] globalXid = new byte[64];
+            for (int i = 0; i < 64; i++) {
+                globalXid[i] = (byte) (Math.random() * 255);
+            }
+            byte[] branchQualifier = new byte[0];
 
+            try {
+                producer.resetTransactionManager(0, globalXid, branchQualifier);
+            } catch (Exception e) {
+                throw e;
+            }
             consumer.subscribe(singleton(inputTopic), this);
 
             Utils.printOut("Processing new records");
@@ -124,21 +111,32 @@ public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebal
                     ConsumerRecords<Integer, String> records = consumer.poll(ofMillis(200));
                     if (!records.isEmpty()) {
                         // begin a new transaction session
-                        producer.beginTransaction();
+                        //producer.beginTransaction();
 
                         for (ConsumerRecord<Integer, String> record : records) {
                             // process the record and send downstream
                             ProducerRecord<Integer, String> newRecord =
                                 new ProducerRecord<>(outputTopic, record.key(), record.value() + "-ok");
-                            producer.send(newRecord);
+                            Future<RecordMetadata> sendFuture = producer.send(newRecord);
+                            sendFuture.get();
                         }
 
                         // checkpoint the progress by sending offsets to group coordinator broker
                         // note that this API is only available for broker >= 2.5
                         producer.sendOffsetsToTransaction(getOffsetsToCommit(consumer), consumer.groupMetadata());
 
+                        producer.flush();
+
+                        Object tm = producer.getTransactionManager();
+                        producer.unlinkTransactionManager();
+
+                        producer.prepareTransaction(0, globalXid, branchQualifier);
+
                         // commit the transaction including offsets
-                        producer.commitTransaction();
+                        producer.commitTransaction(0, globalXid, branchQualifier);
+
+                        producer.linkTransactionManager(tm);
+
                         processedRecords += records.count();
                     }
                 } catch (AuthorizationException | UnsupportedVersionException | ProducerFencedException
@@ -213,16 +211,5 @@ public class ExactlyOnceMessageProcessor extends Thread implements ConsumerRebal
                 return 0;
             }
         }).sum();
-    }
-
-    @Override
-    public void close() throws Exception {
-        if (producer != null) {
-            producer.close();
-        }
-
-        if (consumer != null) {
-            consumer.close();
-        }
     }
 }

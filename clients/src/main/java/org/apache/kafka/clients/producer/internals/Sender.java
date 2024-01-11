@@ -122,7 +122,9 @@ public class Sender implements Runnable {
     private final ApiVersions apiVersions;
 
     /* all the state related to transactions, in particular the producer id, producer epoch, and sequence numbers */
-    private final TransactionManager transactionManager;
+    private final TransactionManager.TransactionManagerReference transactionManager;
+
+    private final StatelessTransactionManager statelessTransactionManager;
 
     // A per-partition queue of batches ordered by creation time for tracking the in-flight batches
     private final Map<TopicPartition, List<ProducerBatch>> inFlightBatches;
@@ -139,7 +141,8 @@ public class Sender implements Runnable {
                   Time time,
                   int requestTimeoutMs,
                   long retryBackoffMs,
-                  TransactionManager transactionManager,
+                  TransactionManager.TransactionManagerReference transactionManager,
+                  StatelessTransactionManager statelessTransactionManager,
                   ApiVersions apiVersions) {
         this.log = logContext.logger(Sender.class);
         this.client = client;
@@ -156,6 +159,7 @@ public class Sender implements Runnable {
         this.retryBackoffMs = retryBackoffMs;
         this.apiVersions = apiVersions;
         this.transactionManager = transactionManager;
+        this.statelessTransactionManager = statelessTransactionManager;
         this.inFlightBatches = new HashMap<>();
     }
 
@@ -230,7 +234,7 @@ public class Sender implements Runnable {
     }
 
     private boolean hasPendingTransactionalRequests() {
-        return transactionManager != null && transactionManager.hasPendingRequests() && transactionManager.hasOngoingTransaction();
+        return transactionManager != null && transactionManager.get().hasPendingRequests() && transactionManager.get().hasOngoingTransaction();
     }
 
     /**
@@ -240,9 +244,13 @@ public class Sender implements Runnable {
     public void run() {
         log.debug("Starting Kafka producer I/O thread.");
 
-        if (transactionManager != null)
-            transactionManager.setPoisonStateOnInvalidTransition(true);
-
+        if (transactionManager != null) {
+            transactionManager.withTransactionManager(
+                    () -> {
+                        transactionManager.get().setPoisonStateOnInvalidTransition(true);
+                        return true;
+                    });
+        }
         // main loop, runs until close is called
         while (running) {
             try {
@@ -266,14 +274,14 @@ public class Sender implements Runnable {
         }
 
         // Abort the transaction if any commit or abort didn't go through the transaction manager's queue
-        while (!forceClose && transactionManager != null && transactionManager.hasOngoingTransaction()) {
-            if (!transactionManager.isCompleting()) {
+        while (!forceClose && transactionManager != null && transactionManager.get().hasOngoingTransaction()) {
+            if (!transactionManager.get().isCompleting()) {
                 log.info("Aborting incomplete transaction due to shutdown");
 
                 try {
                     // It is possible for the transaction manager to throw errors when aborting. Catch these
                     // so as not to interfere with the rest of the shutdown logic.
-                    transactionManager.beginAbort();
+                    transactionManager.get().beginAbort();
                 } catch (Exception e) {
                     log.error("Error in kafka producer I/O thread while aborting transaction: ", e);
                 }
@@ -290,7 +298,7 @@ public class Sender implements Runnable {
             // the futures.
             if (transactionManager != null) {
                 log.debug("Aborting incomplete transactional requests due to forced shutdown");
-                transactionManager.close();
+                transactionManager.get().close();
             }
             log.debug("Aborting incomplete batches due to forced shutdown");
             this.accumulator.abortIncompleteBatches();
@@ -310,35 +318,44 @@ public class Sender implements Runnable {
      */
     void runOnce() {
         if (transactionManager != null) {
-            try {
-                transactionManager.maybeResolveSequences();
+            boolean messageSent = transactionManager.withTransactionManager(
+                () -> {
+                    try {
+                        transactionManager.get().maybeResolveSequences();
 
-                RuntimeException lastError = transactionManager.lastError();
+                        RuntimeException lastError = transactionManager.get().lastError();
 
-                // do not continue sending if the transaction manager is in a failed state
-                if (transactionManager.hasFatalError()) {
-                    if (lastError != null)
-                        maybeAbortBatches(lastError);
-                    client.poll(retryBackoffMs, time.milliseconds());
-                    return;
-                }
+                        // do not continue sending if the transaction manager is in a failed state
+                        if (transactionManager.get().hasFatalError()) {
+                            if (lastError != null)
+                                maybeAbortBatches(lastError);
+                            client.poll(retryBackoffMs, time.milliseconds());
+                            return false;
+                        }
 
-                if (transactionManager.hasAbortableError() && shouldHandleAuthorizationError(lastError)) {
-                    return;
-                }
+                        if (transactionManager.get().hasAbortableError() && shouldHandleAuthorizationError(lastError)) {
+                            return false;
+                        }
 
-                // Check whether we need a new producerId. If so, we will enqueue an InitProducerId
-                // request which will be sent below
-                transactionManager.bumpIdempotentEpochAndResetIdIfNeeded();
+                        // Check whether we need a new producerId. If so, we will enqueue an InitProducerId
+                        // request which will be sent below
+                        transactionManager.get().bumpIdempotentEpochAndResetIdIfNeeded();
 
-                if (maybeSendAndPollTransactionalRequest()) {
-                    return;
-                }
-            } catch (AuthenticationException e) {
-                // This is already logged as error, but propagated here to perform any clean ups.
-                log.trace("Authentication exception while processing transactional request", e);
-                transactionManager.authenticationFailed(e);
+                        return maybeSendAndPollTransactionalRequest();
+                    } catch (AuthenticationException e) {
+                        // This is already logged as error, but propagated here to perform any clean ups.
+                        log.trace("Authentication exception while processing transactional request", e);
+                        transactionManager.get().authenticationFailed(e);
+                    }
+                    return false;
+                });
+            if (messageSent) {
+                return;
             }
+        }
+
+        if (maybeSendAndPollStatelessTransactionalRequest()) {
+            return;
         }
 
         long currentTimeMs = time.milliseconds();
@@ -352,9 +369,9 @@ public class Sender implements Runnable {
     private boolean shouldHandleAuthorizationError(RuntimeException exception) {
         if (exception instanceof TransactionalIdAuthorizationException ||
                         exception instanceof ClusterAuthorizationException) {
-            transactionManager.failPendingRequests(new AuthenticationException(exception));
+            transactionManager.get().failPendingRequests(new AuthenticationException(exception));
             maybeAbortBatches(exception);
-            transactionManager.transitionToUninitialized(exception);
+            transactionManager.get().transitionToUninitialized(exception);
             return true;
         }
         return false;
@@ -423,7 +440,7 @@ public class Sender implements Runnable {
             failBatch(expiredBatch, new TimeoutException(errorMessage), false);
             if (transactionManager != null && expiredBatch.inRetry()) {
                 // This ensures that no new batches are drained until the current in flight batches are fully resolved.
-                transactionManager.markSequenceUnresolved(expiredBatch);
+                transactionManager.get().markSequenceUnresolved(expiredBatch);
             }
         }
         sensors.updateProduceRequestMetrics(batches);
@@ -452,16 +469,16 @@ public class Sender implements Runnable {
      * Returns true if a transactional request is sent or polled, or if a FindCoordinator request is enqueued
      */
     private boolean maybeSendAndPollTransactionalRequest() {
-        if (transactionManager.hasInFlightRequest()) {
+        if (transactionManager.get().hasInFlightRequest()) {
             // as long as there are outstanding transactional requests, we simply wait for them to return
             client.poll(retryBackoffMs, time.milliseconds());
             return true;
         }
 
-        if (transactionManager.hasAbortableError() || transactionManager.isAborting()) {
+        if (transactionManager.get().hasAbortableError() || transactionManager.get().isAborting()) {
             if (accumulator.hasIncomplete()) {
                 // Attempt to get the last error that caused this abort.
-                RuntimeException exception = transactionManager.lastError();
+                RuntimeException exception = transactionManager.get().lastError();
                 // If there was no error, but we are still aborting,
                 // then this is most likely a case where there was no fatal error.
                 if (exception == null) {
@@ -471,7 +488,7 @@ public class Sender implements Runnable {
             }
         }
 
-        TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.nextRequest(accumulator.hasIncomplete());
+        TransactionManager.TxnRequestHandler nextRequestHandler = transactionManager.get().nextRequest(accumulator.hasIncomplete());
         if (nextRequestHandler == null)
             return false;
 
@@ -480,7 +497,7 @@ public class Sender implements Runnable {
         try {
             FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
             targetNode = coordinatorType != null ?
-                    transactionManager.coordinator(coordinatorType) :
+                    transactionManager.get().coordinator(coordinatorType) :
                     client.leastLoadedNode(time.milliseconds());
             if (targetNode != null) {
                 if (!awaitNodeReady(targetNode, coordinatorType)) {
@@ -494,7 +511,7 @@ public class Sender implements Runnable {
                 return true;
             } else {
                 log.trace("No nodes available to send requests, will poll and retry when until a node is ready.");
-                transactionManager.retry(nextRequestHandler);
+                transactionManager.get().retry(nextRequestHandler);
                 client.poll(retryBackoffMs, time.milliseconds());
                 return true;
             }
@@ -507,7 +524,7 @@ public class Sender implements Runnable {
                 true, requestTimeoutMs, nextRequestHandler);
             log.debug("Sending transactional request {} to node {} with correlation ID {}", requestBuilder, targetNode, clientRequest.correlationId());
             client.send(clientRequest, currentTimeMs);
-            transactionManager.setInFlightCorrelationId(clientRequest.correlationId());
+            transactionManager.get().setInFlightCorrelationId(clientRequest.correlationId());
             client.poll(retryBackoffMs, time.milliseconds());
             return true;
         } catch (IOException e) {
@@ -519,16 +536,81 @@ public class Sender implements Runnable {
         }
     }
 
+    private boolean maybeSendAndPollStatelessTransactionalRequest() {
+        // Should only be true for testing
+        if (this.statelessTransactionManager == null) {
+            return false;
+        }
+
+        StatelessTransactionManager.TxnRequestHandler nextRequestHandler = this.statelessTransactionManager.nextRequest();
+        if (nextRequestHandler == null)
+            return false;
+
+        AbstractRequest.Builder<?> requestBuilder = nextRequestHandler.requestBuilder();
+        Node targetNode = null;
+        try {
+            FindCoordinatorRequest.CoordinatorType coordinatorType = nextRequestHandler.coordinatorType();
+            targetNode = coordinatorType != null ?
+                    StatelessTransactionManager.getTransactionCoordinatorForTransaction(nextRequestHandler.coordinatorKey()) :
+                    client.leastLoadedNode(time.milliseconds());
+            if (targetNode != null) {
+                if (!NetworkClientUtils.awaitReady(client, targetNode, time, requestTimeoutMs)) {
+                    log.trace("Target node {} not ready within request timeout, will retry when node is ready.", targetNode);
+                    maybeFindCoordinatorAndRetry(nextRequestHandler);
+                    return true;
+                }
+            } else if (coordinatorType != null) {
+                log.trace("Coordinator not known for {}, will retry {} after finding coordinator.", coordinatorType, requestBuilder.apiKey());
+                maybeFindCoordinatorAndRetry(nextRequestHandler);
+                return true;
+            } else {
+                log.trace("No nodes available to send requests, will poll and retry when until a node is ready.");
+                statelessTransactionManager.retry(nextRequestHandler);
+                client.poll(retryBackoffMs, time.milliseconds());
+                return true;
+            }
+
+            if (nextRequestHandler.isRetry())
+                time.sleep(nextRequestHandler.retryBackoffMs());
+
+            long currentTimeMs = time.milliseconds();
+            ClientRequest clientRequest = client.newClientRequest(targetNode.idString(), requestBuilder, currentTimeMs,
+                    true, requestTimeoutMs, nextRequestHandler);
+            log.debug("Sending stateless transactional request {} to node {} with correlation ID {}", requestBuilder, targetNode, clientRequest.correlationId());
+            client.send(clientRequest, currentTimeMs);
+            client.poll(retryBackoffMs, time.milliseconds());
+            return true;
+        } catch (IOException e) {
+            log.debug("Disconnect from {} while trying to send stateless transactional request {}. Going " +
+                    "to back off and retry.", targetNode, requestBuilder, e);
+            // We break here so that we pick up the FindCoordinator request immediately.
+            maybeFindCoordinatorAndRetry(nextRequestHandler);
+            return true;
+        }
+    }
+
     private void maybeFindCoordinatorAndRetry(TransactionManager.TxnRequestHandler nextRequestHandler) {
         if (nextRequestHandler.needsCoordinator()) {
-            transactionManager.lookupCoordinator(nextRequestHandler);
+            transactionManager.get().lookupCoordinator(nextRequestHandler);
         } else {
             // For non-coordinator requests, sleep here to prevent a tight loop when no node is available
             time.sleep(retryBackoffMs);
             metadata.requestUpdate(false);
         }
 
-        transactionManager.retry(nextRequestHandler);
+        transactionManager.get().retry(nextRequestHandler);
+    }
+
+    private void maybeFindCoordinatorAndRetry(StatelessTransactionManager.TxnRequestHandler nextRequestHandler) {
+        if (nextRequestHandler.needsCoordinator()) {
+            statelessTransactionManager.lookupCoordinator(nextRequestHandler);
+        } else {
+            // For non-coordinator requests, sleep here to prevent a tight loop when no node is available
+            time.sleep(retryBackoffMs);
+            metadata.requestUpdate(false);
+        }
+
+        statelessTransactionManager.retry(nextRequestHandler);
     }
 
     private void maybeAbortBatches(RuntimeException exception) {
@@ -567,7 +649,7 @@ public class Sender implements Runnable {
                 // Indicate to the transaction manager that the coordinator is ready, allowing it to check ApiVersions
                 // This allows us to bump transactional epochs even if the coordinator is temporarily unavailable at
                 // the time when the abortable error is handled
-                transactionManager.handleCoordinatorReady();
+                transactionManager.get().handleCoordinatorReady();
             }
             return true;
         }
@@ -672,7 +754,7 @@ public class Sender implements Runnable {
                 this.retries - batch.attempts(),
                 formatErrMsg(response));
             if (transactionManager != null)
-                transactionManager.removeInFlightBatch(batch);
+                transactionManager.get().removeInFlightBatch(batch);
             this.accumulator.splitAndReenqueue(batch);
             maybeRemoveAndDeallocateBatch(batch);
             this.sensors.recordBatchSplit();
@@ -745,7 +827,7 @@ public class Sender implements Runnable {
 
     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response) {
         if (transactionManager != null) {
-            transactionManager.handleCompletedBatch(batch, response);
+            transactionManager.get().handleCompletedBatch(batch, response);
         }
 
         if (batch.complete(response.baseOffset, response.logAppendTime)) {
@@ -829,7 +911,7 @@ public class Sender implements Runnable {
                 try {
                     // This call can throw an exception in the rare case that there's an invalid state transition
                     // attempted. Catch these so as not to interfere with the rest of the logic.
-                    transactionManager.handleFailedBatch(batch, topLevelException, adjustSequenceNumbers);
+                    transactionManager.get().handleFailedBatch(batch, topLevelException, adjustSequenceNumbers);
                 } catch (Exception e) {
                     log.debug("Encountered error when transaction manager was handling a failed batch", e);
                 }
@@ -849,7 +931,7 @@ public class Sender implements Runnable {
             !batch.isDone() &&
             (transactionManager == null ?
                     response.error.exception() instanceof RetriableException :
-                    transactionManager.canRetry(response, batch));
+                    transactionManager.get().canRetry(response, batch));
     }
 
     /**
@@ -901,8 +983,8 @@ public class Sender implements Runnable {
         }
 
         String transactionalId = null;
-        if (transactionManager != null && transactionManager.isTransactional()) {
-            transactionalId = transactionManager.transactionalId();
+        if (transactionManager != null && transactionManager.get().isTransactional()) {
+            transactionalId = transactionManager.get().transactionalId();
         }
 
         ProduceRequest.Builder requestBuilder = ProduceRequest.forMagic(minUsedMagic,

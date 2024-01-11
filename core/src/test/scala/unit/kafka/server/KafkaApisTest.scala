@@ -2068,6 +2068,7 @@ class KafkaApisTest extends Logging {
         ArgumentMatchers.eq(transactionalId),
         ArgumentMatchers.eq(txnTimeoutMs),
         ArgumentMatchers.eq(expectedProducerIdAndEpoch),
+        null,
         responseCallback.capture(),
         ArgumentMatchers.eq(requestLocal)
       )).thenAnswer(_ => responseCallback.getValue.apply(InitProducerIdResult(producerId, epoch, Errors.PRODUCER_FENCED)))

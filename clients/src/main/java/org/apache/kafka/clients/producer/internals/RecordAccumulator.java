@@ -88,7 +88,7 @@ public class RecordAccumulator {
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
     private final Set<TopicPartition> muted;
     private final Map<String, Integer> nodesDrainIndex;
-    private final TransactionManager transactionManager;
+    private final TransactionManager.TransactionManagerReference transactionManager;
     private long nextBatchExpiryTimeMs = Long.MAX_VALUE; // the earliest time (absolute) a batch will expire.
 
     /**
@@ -125,7 +125,7 @@ public class RecordAccumulator {
                              String metricGrpName,
                              Time time,
                              ApiVersions apiVersions,
-                             TransactionManager transactionManager,
+                             TransactionManager.TransactionManagerReference transactionManager,
                              BufferPool bufferPool) {
         this.logContext = logContext;
         this.log = logContext.logger(RecordAccumulator.class);
@@ -184,7 +184,7 @@ public class RecordAccumulator {
                              String metricGrpName,
                              Time time,
                              ApiVersions apiVersions,
-                             TransactionManager transactionManager,
+                             TransactionManager.TransactionManagerReference transactionManager,
                              BufferPool bufferPool) {
         this(logContext,
             batchSize,
@@ -544,7 +544,7 @@ public class RecordAccumulator {
             synchronized (partitionDequeue) {
                 if (transactionManager != null) {
                     // We should track the newly created batches since they already have assigned sequences.
-                    transactionManager.addInFlightBatch(batch);
+                    transactionManager.get().addInFlightBatch(batch);
                     insertInSequenceOrder(partitionDequeue, batch);
                 } else {
                     partitionDequeue.addFirst(batch);
@@ -570,7 +570,7 @@ public class RecordAccumulator {
             throw new IllegalStateException("Trying to re-enqueue a batch which doesn't have a sequence even " +
                 "though idempotency is enabled.");
 
-        if (!transactionManager.hasInflightBatches(batch.topicPartition))
+        if (!transactionManager.get().hasInflightBatches(batch.topicPartition))
             throw new IllegalStateException("We are re-enqueueing a batch which is not tracked as part of the in flight " +
                 "requests. batch.topicPartition: " + batch.topicPartition + "; batch.baseSequence: " + batch.baseSequence());
 
@@ -626,7 +626,7 @@ public class RecordAccumulator {
         if (!readyNodes.contains(leader) && !isMuted(part)) {
             long timeToWaitMs = backingOff ? retryBackoff.backoff(backoffAttempts > 0 ? backoffAttempts - 1 : 0) : lingerMs;
             boolean expired = waitedTimeMs >= timeToWaitMs;
-            boolean transactionCompleting = transactionManager != null && transactionManager.isCompleting();
+            boolean transactionCompleting = transactionManager != null && transactionManager.get().isCompleting();
             boolean sendable = full
                     || expired
                     || exhausted
@@ -826,30 +826,30 @@ public class RecordAccumulator {
     private boolean shouldStopDrainBatchesForPartition(ProducerBatch first, TopicPartition tp) {
         ProducerIdAndEpoch producerIdAndEpoch;
         if (transactionManager != null) {
-            if (!transactionManager.isSendToPartitionAllowed(tp))
+            if (!transactionManager.get().isSendToPartitionAllowed(tp))
                 return true;
 
-            producerIdAndEpoch = transactionManager.producerIdAndEpoch();
+            producerIdAndEpoch = transactionManager.get().producerIdAndEpoch();
             if (!producerIdAndEpoch.isValid())
                 // we cannot send the batch until we have refreshed the producer id
                 return true;
 
             if (!first.hasSequence()) {
-                if (transactionManager.hasInflightBatches(tp) && transactionManager.hasStaleProducerIdAndEpoch(tp)) {
+                if (transactionManager.get().hasInflightBatches(tp) && transactionManager.get().hasStaleProducerIdAndEpoch(tp)) {
                     // Don't drain any new batches while the partition has in-flight batches with a different epoch
                     // and/or producer ID. Otherwise, a batch with a new epoch and sequence number
                     // 0 could be written before earlier batches complete, which would cause out of sequence errors
                     return true;
                 }
 
-                if (transactionManager.hasUnresolvedSequence(first.topicPartition))
+                if (transactionManager.get().hasUnresolvedSequence(first.topicPartition))
                     // Don't drain any new batches while the state of previous sequence numbers
                     // is unknown. The previous batches would be unknown if they were aborted
                     // on the client after being sent to the broker at least once.
                     return true;
             }
 
-            int firstInFlightSequence = transactionManager.firstInFlightSequence(first.topicPartition);
+            int firstInFlightSequence = transactionManager.get().firstInFlightSequence(first.topicPartition);
             if (firstInFlightSequence != RecordBatch.NO_SEQUENCE && first.hasSequence()
                 && first.baseSequence() != firstInFlightSequence)
                 // If the queued batch already has an assigned sequence, then it is being retried.
@@ -914,15 +914,15 @@ public class RecordAccumulator {
 
                 batch = deque.pollFirst();
 
-                boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
+                boolean isTransactional = transactionManager != null && transactionManager.get().isTransactional();
                 ProducerIdAndEpoch producerIdAndEpoch =
-                    transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
+                    transactionManager != null ? transactionManager.get().producerIdAndEpoch() : null;
                 if (producerIdAndEpoch != null && !batch.hasSequence()) {
                     // If the producer id/epoch of the partition do not match the latest one
                     // of the producer, we update it and reset the sequence. This should be
                     // only done when all its in-flight batches have completed. This is guarantee
                     // in `shouldStopDrainBatchesForPartition`.
-                    transactionManager.maybeUpdateProducerIdAndEpoch(batch.topicPartition);
+                    transactionManager.get().maybeUpdateProducerIdAndEpoch(batch.topicPartition);
 
                     // If the batch already has an assigned sequence, then we should not change the producer id and
                     // sequence number, since this may introduce duplicates. In particular, the previous attempt
@@ -932,13 +932,13 @@ public class RecordAccumulator {
                     // Additionally, we update the next sequence number bound for the partition, and also have
                     // the transaction manager track the batch so as to ensure that sequence ordering is maintained
                     // even if we receive out of order responses.
-                    batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
-                    transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
+                    batch.setProducerState(producerIdAndEpoch, transactionManager.get().sequenceNumber(batch.topicPartition), isTransactional);
+                    transactionManager.get().incrementSequenceNumber(batch.topicPartition, batch.recordCount);
                     log.debug("Assigned producerId {} and producerEpoch {} to batch with base sequence " +
                             "{} being sent to partition {}", producerIdAndEpoch.producerId,
                         producerIdAndEpoch.epoch, batch.baseSequence(), tp);
 
-                    transactionManager.addInFlightBatch(batch);
+                    transactionManager.get().addInFlightBatch(batch);
                 }
             }
 

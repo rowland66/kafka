@@ -232,19 +232,14 @@ public class RemoteLogManager implements Closeable {
     }
 
     RemoteStorageManager createRemoteStorageManager() {
-        return java.security.AccessController.doPrivileged(new PrivilegedAction<RemoteStorageManager>() {
-            private final String classPath = rlmConfig.remoteStorageManagerClassPath();
-
-            public RemoteStorageManager run() {
-                if (classPath != null && !classPath.trim().isEmpty()) {
-                    ChildFirstClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());
-                    RemoteStorageManager delegate = createDelegate(classLoader, rlmConfig.remoteStorageManagerClassName());
-                    return new ClassLoaderAwareRemoteStorageManager(delegate, classLoader);
-                } else {
-                    return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteStorageManagerClassName());
-                }
-            }
-        });
+        final String classPath = rlmConfig.remoteStorageManagerClassPath();
+        if (classPath != null && !classPath.trim().isEmpty()) {
+            ChildFirstClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());
+            RemoteStorageManager delegate = createDelegate(classLoader, rlmConfig.remoteStorageManagerClassName());
+            return new ClassLoaderAwareRemoteStorageManager(delegate, classLoader);
+        } else {
+            return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteStorageManagerClassName());
+        }
     }
 
     private void configureRSM() {
@@ -254,19 +249,15 @@ public class RemoteLogManager implements Closeable {
     }
 
     RemoteLogMetadataManager createRemoteLogMetadataManager() {
-        return java.security.AccessController.doPrivileged(new PrivilegedAction<RemoteLogMetadataManager>() {
-            private final String classPath = rlmConfig.remoteLogMetadataManagerClassPath();
+        final String classPath = rlmConfig.remoteLogMetadataManagerClassPath();
 
-            public RemoteLogMetadataManager run() {
-                if (classPath != null && !classPath.trim().isEmpty()) {
-                    ClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());
-                    RemoteLogMetadataManager delegate = createDelegate(classLoader, rlmConfig.remoteLogMetadataManagerClassName());
-                    return new ClassLoaderAwareRemoteLogMetadataManager(delegate, classLoader);
-                } else {
-                    return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteLogMetadataManagerClassName());
-                }
-            }
-        });
+        if (classPath != null && !classPath.trim().isEmpty()) {
+            ClassLoader classLoader = new ChildFirstClassLoader(classPath, this.getClass().getClassLoader());
+            RemoteLogMetadataManager delegate = createDelegate(classLoader, rlmConfig.remoteLogMetadataManagerClassName());
+            return new ClassLoaderAwareRemoteLogMetadataManager(delegate, classLoader);
+        } else {
+            return createDelegate(this.getClass().getClassLoader(), rlmConfig.remoteLogMetadataManagerClassName());
+        }
     }
 
     public void onEndPointCreated(EndPoint endpoint) {
@@ -1277,7 +1268,7 @@ public class RemoteLogManager implements Closeable {
      * does not contain any messages/records associated with them.
      *
      * For ex:
-     *  <epoch - start offset>
+     *  &ltepoch - start offset&gt
      *  0 - 0
      *  1 - 10
      *  2 - 20
@@ -1288,7 +1279,7 @@ public class RemoteLogManager implements Closeable {
      *  7 - 70
      *
      *  When the above leaderEpochMap is passed to this method, it returns the following map:
-     *  <epoch - start offset>
+     *  &ltepoch - start offset&gt
      *  0 - 0
      *  1 - 10
      *  2 - 20

@@ -16,11 +16,7 @@
  */
 package kafka.examples;
 
-import org.apache.kafka.clients.producer.Callback;
-import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.clients.producer.*;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.FencedInstanceIdException;
@@ -103,7 +99,7 @@ public class Producer extends Thread {
         }
     }
 
-    public KafkaProducer<Integer, String> createKafkaProducer() {
+    public XAKafkaProducer<Integer, String> createKafkaProducer() {
         Properties props = new Properties();
         // bootstrap server config is required for producer to connect to brokers
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
@@ -124,7 +120,9 @@ public class Producer extends Thread {
         }
         // enable duplicates protection at the partition level
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, enableIdempotency);
-        return new KafkaProducer<>(props);
+        props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 300_000);
+        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 300_000);
+        return new XAKafkaProducer<>(props);
     }
 
     private void asyncSend(KafkaProducer<Integer, String> producer, int key, String value) {

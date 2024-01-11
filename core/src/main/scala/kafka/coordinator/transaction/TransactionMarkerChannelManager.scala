@@ -274,7 +274,9 @@ class TransactionMarkerChannelManager(
         if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {
           debug(s"Sending $transactionalId's transaction markers for $txnMetadata with " +
             s"coordinator epoch $coordinatorEpoch succeeded, trying to append complete transaction log now")
-          tryAppendToLog(PendingCompleteTxn(transactionalId, coordinatorEpoch, txnMetadata, newMetadata))
+          if (!epochAndMetadata.transactionMetadata.isExternal) {
+            tryAppendToLog(PendingCompleteTxn(transactionalId, coordinatorEpoch, txnMetadata, newMetadata))
+          }
         } else {
           info(s"The cached metadata $txnMetadata has changed to $epochAndMetadata after " +
             s"completed sending the markers with coordinator epoch $coordinatorEpoch; abort " +

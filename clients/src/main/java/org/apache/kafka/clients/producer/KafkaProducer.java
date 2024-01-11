@@ -32,6 +32,7 @@ import org.apache.kafka.clients.producer.internals.ProducerMetadata;
 import org.apache.kafka.clients.producer.internals.ProducerMetrics;
 import org.apache.kafka.clients.producer.internals.RecordAccumulator;
 import org.apache.kafka.clients.producer.internals.Sender;
+import org.apache.kafka.clients.producer.internals.StatelessTransactionManager;
 import org.apache.kafka.clients.producer.internals.TransactionManager;
 import org.apache.kafka.clients.producer.internals.TransactionalRequestResult;
 import org.apache.kafka.common.Cluster;
@@ -71,6 +72,7 @@ import org.apache.kafka.common.telemetry.internals.ClientTelemetryUtils;
 import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.common.utils.KafkaThread;
 import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.ProducerIdAndEpoch;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Timer;
 import org.apache.kafka.common.utils.Utils;
@@ -260,7 +262,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private final boolean partitionerIgnoreKeys;
     private final ProducerInterceptors<K, V> interceptors;
     private final ApiVersions apiVersions;
-    private final TransactionManager transactionManager;
+    TransactionManager.TransactionManagerReference transactionManager; // contolled by the XAKafkaProducer
+    private final StatelessTransactionManager statelessTransactionManager;
     private final Optional<ClientTelemetryReporter> clientTelemetryReporter;
 
     /**
@@ -419,7 +422,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             int deliveryTimeoutMs = configureDeliveryTimeout(config, log);
 
             this.apiVersions = new ApiVersions();
-            this.transactionManager = configureTransactionState(config, logContext);
+            this.transactionManager = new TransactionManager.TransactionManagerReference(configureTransactionState(config, logContext));
+            this.statelessTransactionManager = new StatelessTransactionManager(
+                    logContext,
+                    config.getInt(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG),
+                    config.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG),
+                    apiVersions);
             // There is no need to do work required for adaptive partitioning, if we use a custom partitioner.
             boolean enableAdaptivePartitioning = partitioner == null &&
                 config.getBoolean(ProducerConfig.PARTITIONER_ADPATIVE_PARTITIONING_ENABLE_CONFIG);
@@ -505,7 +513,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         this.maxBlockTimeMs = config.getLong(ProducerConfig.MAX_BLOCK_MS_CONFIG);
         this.partitionerIgnoreKeys = config.getBoolean(ProducerConfig.PARTITIONER_IGNORE_KEYS_CONFIG);
         this.apiVersions = new ApiVersions();
-        this.transactionManager = transactionManager;
+        this.transactionManager = new TransactionManager.TransactionManagerReference(transactionManager);
+        this.statelessTransactionManager = null; // TODO: Fix me for testing
         this.accumulator = accumulator;
         this.errors = this.metrics.sensor("errors");
         this.metadata = metadata;
@@ -545,6 +554,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 requestTimeoutMs,
                 producerConfig.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG),
                 this.transactionManager,
+                this.statelessTransactionManager,
                 apiVersions);
     }
 
@@ -592,14 +602,26 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             );
 
             if (transactionManager.isTransactional())
-                log.info("Instantiated a transactional producer.");
+                log.info("Instantiated a producer with a transaction id.");
             else
-                log.info("Instantiated an idempotent producer.");
+                log.info("Instantiated a producer without a transactional id.");
         } else {
             // ignore unretrieved configurations related to producer transaction
             config.ignore(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG);
         }
         return transactionManager;
+    }
+
+    TransactionManager resetTransactionManager(long producerId, String transactionalId) {
+        LogContext logContext = new LogContext(String.format("[Producer clientId=%s, transactionalId=%s] ", clientId, transactionalId));
+        this.transactionManager.set(configureTransactionState(this.producerConfig, logContext));
+        this.transactionManager.get().setProducerIdAndEpoch(new ProducerIdAndEpoch(producerId, (short) 0));
+        this.transactionManager.get().setTransactionalId(transactionalId);
+        TransactionalRequestResult result = this.transactionManager.get().initializeWithExternalTransaction(producerId);
+        sender.wakeup();
+        result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+        this.transactionManager.get().beginTransaction();
+        return this.transactionManager.get();
     }
 
     /**
@@ -632,7 +654,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
         long now = time.nanoseconds();
-        TransactionalRequestResult result = transactionManager.initializeTransactions();
+        TransactionalRequestResult result = transactionManager.get().initializeTransactions();
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
         producerMetrics.recordInit(time.nanoseconds() - now);
@@ -657,7 +679,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
         long now = time.nanoseconds();
-        transactionManager.beginTransaction();
+        transactionManager.get().beginTransaction();
         producerMetrics.recordBeginTxn(time.nanoseconds() - now);
     }
 
@@ -756,50 +778,85 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
 
         if (!offsets.isEmpty()) {
             long start = time.nanoseconds();
-            TransactionalRequestResult result = transactionManager.sendOffsetsToTransaction(offsets, groupMetadata);
+            TransactionalRequestResult result = transactionManager.get().sendOffsetsToTransaction(offsets, groupMetadata);
             sender.wakeup();
             result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
             producerMetrics.recordSendOffsets(time.nanoseconds() - start);
         }
     }
 
+    void internalPrepareTransaction(
+            int txnIdFormat,
+            byte[] externalTxnId,
+            byte[] externalTxnIdBranch,
+            long producerId,
+            String transactionalId) {
+        throwIfProducerClosed();
+        //long commitStart = time.nanoseconds();
+        TransactionalRequestResult result = statelessTransactionManager.beginPrepare(
+                producerId,
+                transactionalId);
+        sender.wakeup();
+
+        result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+        //producerMetrics.recordCommitTxn(time.nanoseconds() - commitStart);
+    }
+
+    void internalCommitTransaction(long producerId, String transactionalId) {
+        throwIfProducerClosed();
+        //long commitStart = time.nanoseconds();
+        TransactionalRequestResult result = statelessTransactionManager.beginCommit(producerId, transactionalId);
+        sender.wakeup();
+        result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+        //producerMetrics.recordCommitTxn(time.nanoseconds() - commitStart);
+    }
+
+    void internalAbortTransaction(long producerId, String transactionalId) {
+        throwIfProducerClosed();
+        //long commitStart = time.nanoseconds();
+        TransactionalRequestResult result = statelessTransactionManager.beginAbort(producerId, transactionalId);
+        sender.wakeup();
+        result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
+        //producerMetrics.recordCommitTxn(time.nanoseconds() - commitStart);
+    }
+
     /**
-     * Commits the ongoing transaction. This method will flush any unsent records before actually committing the transaction.
-     * <p>
-     * Further, if any of the {@link #send(ProducerRecord)} calls which were part of the transaction hit irrecoverable
-     * errors, this method will throw the last received exception immediately and the transaction will not be committed.
-     * So all {@link #send(ProducerRecord)} calls in a transaction must succeed in order for this method to succeed.
-     * <p>
-     * If the transaction is committed successfully and this method returns without throwing an exception, it is guaranteed
-     * that all {@link Callback callbacks} for records in the transaction will have been invoked and completed.
-     * Note that exceptions thrown by callbacks are ignored; the producer proceeds to commit the transaction in any case.
-     * <p>
-     * Note that this method will raise {@link TimeoutException} if the transaction cannot be committed before expiration
-     * of {@code max.block.ms}, but this does not mean the request did not actually reach the broker. In fact, it only indicates
-     * that we cannot get the acknowledgement response in time, so it's up to the application's logic
-     * to decide how to handle timeouts.
-     * Additionally, it will raise {@link InterruptException} if interrupted.
-     * It is safe to retry in either case, but it is not possible to attempt a different operation (such as abortTransaction)
-     * since the commit may already be in the progress of completing. If not retrying, the only option is to close the producer.
-     *
-     * @throws IllegalStateException if no transactional.id has been configured or no transaction has been started
-     * @throws ProducerFencedException fatal error indicating another producer with the same transactional.id is active
-     * @throws org.apache.kafka.common.errors.UnsupportedVersionException fatal error indicating the broker
-     *         does not support transactions (i.e. if its version is lower than 0.11.0.0)
-     * @throws org.apache.kafka.common.errors.AuthorizationException fatal error indicating that the configured
-     *         transactional.id is not authorized. See the exception for more details
-     * @throws org.apache.kafka.common.errors.InvalidProducerEpochException if the producer has attempted to produce with an old epoch
-     *         to the partition leader. See the exception for more details
-     * @throws KafkaException if the producer has encountered a previous fatal or abortable error, or for any
-     *         other unexpected error
-     * @throws TimeoutException if the time taken for committing the transaction has surpassed <code>max.block.ms</code>.
-     * @throws InterruptException if the thread is interrupted while blocked
-     */
+         * Commits the ongoing transaction. This method will flush any unsent records before actually committing the transaction.
+         * <p>
+         * Further, if any of the {@link #send(ProducerRecord)} calls which were part of the transaction hit irrecoverable
+         * errors, this method will throw the last received exception immediately and the transaction will not be committed.
+         * So all {@link #send(ProducerRecord)} calls in a transaction must succeed in order for this method to succeed.
+         * <p>
+         * If the transaction is committed successfully and this method returns without throwing an exception, it is guaranteed
+         * that all {@link Callback callbacks} for records in the transaction will have been invoked and completed.
+         * Note that exceptions thrown by callbacks are ignored; the producer proceeds to commit the transaction in any case.
+         * <p>
+         * Note that this method will raise {@link TimeoutException} if the transaction cannot be committed before expiration
+         * of {@code max.block.ms}, but this does not mean the request did not actually reach the broker. In fact, it only indicates
+         * that we cannot get the acknowledgement response in time, so it's up to the application's logic
+         * to decide how to handle timeouts.
+         * Additionally, it will raise {@link InterruptException} if interrupted.
+         * It is safe to retry in either case, but it is not possible to attempt a different operation (such as abortTransaction)
+         * since the commit may already be in the progress of completing. If not retrying, the only option is to close the producer.
+         *
+         * @throws IllegalStateException if no transactional.id has been configured or no transaction has been started
+         * @throws ProducerFencedException fatal error indicating another producer with the same transactional.id is active
+         * @throws org.apache.kafka.common.errors.UnsupportedVersionException fatal error indicating the broker
+         *         does not support transactions (i.e. if its version is lower than 0.11.0.0)
+         * @throws org.apache.kafka.common.errors.AuthorizationException fatal error indicating that the configured
+         *         transactional.id is not authorized. See the exception for more details
+         * @throws org.apache.kafka.common.errors.InvalidProducerEpochException if the producer has attempted to produce with an old epoch
+         *         to the partition leader. See the exception for more details
+         * @throws KafkaException if the producer has encountered a previous fatal or abortable error, or for any
+         *         other unexpected error
+         * @throws TimeoutException if the time taken for committing the transaction has surpassed <code>max.block.ms</code>.
+         * @throws InterruptException if the thread is interrupted while blocked
+         */
     public void commitTransaction() throws ProducerFencedException {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
         long commitStart = time.nanoseconds();
-        TransactionalRequestResult result = transactionManager.beginCommit();
+        TransactionalRequestResult result = transactionManager.get().beginCommit();
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
         producerMetrics.recordCommitTxn(time.nanoseconds() - commitStart);
@@ -834,7 +891,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         throwIfProducerClosed();
         log.info("Aborting incomplete transaction");
         long abortStart = time.nanoseconds();
-        TransactionalRequestResult result = transactionManager.beginAbort();
+        TransactionalRequestResult result = transactionManager.get().beginAbort();
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
         producerMetrics.recordAbortTxn(time.nanoseconds() - abortStart);
@@ -1060,7 +1117,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             // (as indicated by `abortForNewBatch`). Note that the `Sender` will refuse to dequeue
             // batches from the accumulator until they have been added to the transaction.
             if (transactionManager != null) {
-                transactionManager.maybeAddPartition(appendCallbacks.topicPartition());
+                transactionManager.get().maybeAddPartition(appendCallbacks.topicPartition());
             }
 
             if (result.batchIsFull || result.newBatchCreated) {
@@ -1081,7 +1138,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             this.errors.record();
             this.interceptors.onSendError(record, appendCallbacks.topicPartition(), e);
             if (transactionManager != null) {
-                transactionManager.maybeTransitionToErrorState(e);
+                transactionManager.get().maybeTransitionToErrorState(e);
             }
             return new FutureFailure(e);
         } catch (InterruptedException e) {

@@ -777,6 +777,7 @@ class TransactionStateManagerTest {
       transactionalId = transactionalId,
       producerId = 1,
       producerEpoch = RecordBatch.NO_PRODUCER_EPOCH,
+      isExternal = false,
       txnTimeoutMs = transactionTimeoutMs,
       state = Empty,
       timestamp = time.milliseconds()
@@ -1058,7 +1059,7 @@ class TransactionStateManagerTest {
                                   producerId: Long,
                                   state: TransactionState = Empty,
                                   txnTimeout: Int = transactionTimeoutMs): TransactionMetadata = {
-    TransactionMetadata(transactionalId, producerId, 0.toShort, txnTimeout, state, time.milliseconds())
+    TransactionMetadata(transactionalId, producerId, 0.toShort, isExternal = false, txnTimeout, state, time.milliseconds())
   }
 
   private def prepareTxnLog(topicPartition: TopicPartition,

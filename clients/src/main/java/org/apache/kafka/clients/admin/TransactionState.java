@@ -32,6 +32,7 @@ public enum TransactionState {
     COMPLETE_COMMIT("CompleteCommit"),
     EMPTY("Empty"),
     PREPARE_EPOCH_FENCE("PrepareEpochFence"),
+    PREPARED("Prepared"),
     UNKNOWN("Unknown");
 
     private final static Map<String, TransactionState> NAME_TO_ENUM = Arrays.stream(values())

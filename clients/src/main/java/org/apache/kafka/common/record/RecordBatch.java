@@ -54,6 +54,7 @@ public interface RecordBatch extends Iterable<Record> {
      */
     long NO_PRODUCER_ID = -1L;
     short NO_PRODUCER_EPOCH = -1;
+    short EXTERNAL_TXN_EPOCH = -2;
     int NO_SEQUENCE = -1;
 
     /**

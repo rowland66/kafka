@@ -25,11 +25,10 @@ import org.apache.kafka.common.protocol.{ByteBufferAccessor, MessageUtil}
 import org.apache.kafka.common.protocol.types.Field.TaggedFieldsSection
 import org.apache.kafka.common.protocol.types.{CompactArrayOf, Field, Schema, Struct, Type}
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, SimpleRecord}
-import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 
 import java.nio.ByteBuffer
-import scala.collection.Seq
 import scala.jdk.CollectionConverters._
 
 class TransactionLogTest {
@@ -48,7 +47,7 @@ class TransactionLogTest {
     val transactionalId = "transactionalId"
     val producerId = 23423L
 
-    val txnMetadata = TransactionMetadata(transactionalId, producerId, producerEpoch, transactionTimeoutMs, 0)
+    val txnMetadata = TransactionMetadata(transactionalId, producerId, producerEpoch, isExternal = false, transactionTimeoutMs, 0)
     txnMetadata.addPartitions(topicPartitions)
 
     assertThrows(classOf[IllegalStateException], () => TransactionLog.valueToBytes(txnMetadata.prepareNoTransit()))
@@ -61,18 +60,20 @@ class TransactionLogTest {
       "two" -> 2L,
       "three" -> 3L,
       "four" -> 4L,
-      "five" -> 5L)
+      "five" -> 5L,
+      "six" -> 6L)
 
     val transactionStates = Map[Long, TransactionState](0L -> Empty,
       1L -> Ongoing,
       2L -> PrepareCommit,
       3L -> CompleteCommit,
       4L -> PrepareAbort,
-      5L -> CompleteAbort)
+      5L -> CompleteAbort,
+      6L -> Prepared)
 
     // generate transaction log messages
     val txnRecords = pidMappings.map { case (transactionalId, producerId) =>
-      val txnMetadata = TransactionMetadata(transactionalId, producerId, producerEpoch, transactionTimeoutMs,
+      val txnMetadata = TransactionMetadata(transactionalId, producerId, producerEpoch, isExternal = false, transactionTimeoutMs,
         transactionStates(producerId), 0)
 
       if (!txnMetadata.state.equals(Empty))
@@ -102,6 +103,11 @@ class TransactionLogTest {
       else
         assertEquals(topicPartitions, txnMetadata.topicPartitions)
 
+      if (txnMetadata.state.equals(Prepared))
+        assertTrue(txnMetadata.isExternal)
+      else
+        assertFalse(txnMetadata.isExternal)
+
       count = count + 1
     }
 
@@ -115,7 +121,7 @@ class TransactionLogTest {
     val topicPartition = new TopicPartition("topic", 0)
 
     val txnMetadata = TransactionMetadata(transactionalId, producerId, producerEpoch,
-      transactionTimeoutMs, Ongoing, 0)
+      isExternal = false, transactionTimeoutMs, Ongoing, 0)
     txnMetadata.addPartitions(Set(topicPartition))
 
     val keyBytes = TransactionLog.keyToBytes(transactionalId)
@@ -126,7 +132,7 @@ class TransactionLogTest {
 
     val (keyStringOpt, valueStringOpt) = TransactionLog.formatRecordKeyAndValue(transactionMetadataRecord)
     assertEquals(Some(s"transaction_metadata::transactionalId=$transactionalId"), keyStringOpt)
-    assertEquals(Some(s"producerId:$producerId,producerEpoch:$producerEpoch,state=Ongoing," +
+    assertEquals(Some(s"producerId:$producerId,producerEpoch:$producerEpoch,state=Ongoing,externalTxnId=[1, 1, 1]," +
       s"partitions=[$topicPartition],txnLastUpdateTimestamp=0,txnTimeoutMs=$transactionTimeoutMs"), valueStringOpt)
   }
 
@@ -144,9 +150,9 @@ class TransactionLogTest {
 
   @Test
   def testSerializeTransactionLogValueToHighestNonFlexibleVersion(): Unit = {
-    val txnTransitMetadata = TxnTransitMetadata(1, 1, 1, 1, 1000, CompleteCommit, Set.empty, 500, 500)
+    val txnTransitMetadata = TxnTransitMetadata(1, 1, 1, 1, 1000, CompleteCommit, isExternal = false, Set.empty, 500, 500)
     val txnLogValueBuffer = ByteBuffer.wrap(TransactionLog.valueToBytes(txnTransitMetadata))
-    assertEquals(0, txnLogValueBuffer.getShort)
+    assertEquals(2, txnLogValueBuffer.getShort)
   }
 
   @Test
@@ -164,7 +170,7 @@ class TransactionLogTest {
       .setTransactionTimeoutMs(500)
       .setTransactionPartitions(java.util.Collections.singletonList(txnPartitions))
 
-    val serialized = MessageUtil.toVersionPrefixedByteBuffer(1, txnLogValue)
+    val serialized = MessageUtil.toVersionPrefixedByteBuffer(2, txnLogValue)
     val deserialized = TransactionLog.readTxnRecordValue("transactionId", serialized).get
 
     assertEquals(100, deserialized.producerId)

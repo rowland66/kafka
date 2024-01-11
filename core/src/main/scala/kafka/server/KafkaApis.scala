@@ -207,6 +207,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.OFFSET_FOR_LEADER_EPOCH => handleOffsetForLeaderEpochRequest(request)
         case ApiKeys.ADD_PARTITIONS_TO_TXN => handleAddPartitionsToTxnRequest(request, requestLocal)
         case ApiKeys.ADD_OFFSETS_TO_TXN => handleAddOffsetsToTxnRequest(request, requestLocal)
+        case ApiKeys.PREPARE_TXN => handlePrepareTxnRequest(request, requestLocal)
         case ApiKeys.END_TXN => handleEndTxnRequest(request, requestLocal)
         case ApiKeys.WRITE_TXN_MARKERS => handleWriteTxnMarkersRequest(request, requestLocal)
         case ApiKeys.TXN_OFFSET_COMMIT => handleTxnOffsetCommitRequest(request, requestLocal).exceptionally(handleError)
@@ -2285,13 +2286,23 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val producerIdAndEpoch = (initProducerIdRequest.data.producerId, initProducerIdRequest.data.producerEpoch) match {
       case (RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH) => Right(None)
+      case (_, RecordBatch.EXTERNAL_TXN_EPOCH) => Right(Some(new ProducerIdAndEpoch(initProducerIdRequest.data.producerId, RecordBatch.EXTERNAL_TXN_EPOCH)));
       case (RecordBatch.NO_PRODUCER_ID, _) | (_, RecordBatch.NO_PRODUCER_EPOCH) => Left(Errors.INVALID_REQUEST)
       case (_, _) => Right(Some(new ProducerIdAndEpoch(initProducerIdRequest.data.producerId, initProducerIdRequest.data.producerEpoch)))
     }
 
     producerIdAndEpoch match {
-      case Right(producerIdAndEpoch) => txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.data.transactionTimeoutMs,
-        producerIdAndEpoch, sendResponseCallback, requestLocal)
+      case Right(producerIdAndEpoch) =>
+        producerIdAndEpoch match {
+          case None => txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.data.transactionTimeoutMs,
+            None, null, sendResponseCallback, requestLocal)
+          case Some(producerIdAndEpoch) => (initProducerIdRequest.data.producerId, initProducerIdRequest.data.producerEpoch) match {
+            case (externalTxnProducerId, RecordBatch.EXTERNAL_TXN_EPOCH) => txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.data.transactionTimeoutMs,
+              None, new ProducerIdAndEpoch(externalTxnProducerId, 1), sendResponseCallback, requestLocal)
+            case _ => txnCoordinator.handleInitProducerId(transactionalId, initProducerIdRequest.data.transactionTimeoutMs,
+              Some(producerIdAndEpoch), null, sendResponseCallback, requestLocal)
+          }
+        }
       case Left(error) => requestHelper.sendErrorResponseMaybeThrottle(request, error.exception)
     }
   }
@@ -2334,6 +2345,40 @@ class KafkaApis(val requestChannel: RequestChannel,
         new EndTxnResponse(new EndTxnResponseData()
             .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
             .setThrottleTimeMs(requestThrottleMs))
+      )
+  }
+
+  def handlePrepareTxnRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    ensureInterBrokerVersion(IBP_0_11_0_IV0)
+    val prepareTxnRequest = request.body[PrepareTxnRequest]
+    val transactionalId = prepareTxnRequest.data.transactionalId
+
+    if (authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
+      def sendResponseCallback(error: Errors): Unit = {
+        def createResponse(requestThrottleMs: Int): AbstractResponse = {
+          val responseBody = new PrepareTxnResponse(new PrepareTxnResponseData()
+            .setErrorCode(error.code)
+            .setThrottleTimeMs(requestThrottleMs))
+          trace(s"Completed ${prepareTxnRequest.data.transactionalId}'s PrepareTxnRequest " +
+            s"for externalTxnId: ${prepareTxnRequest.data.transactionalId()}" +
+            s"errors: $error from client ${request.header.clientId}.")
+          responseBody
+        }
+
+        requestHelper.sendResponseMaybeThrottle(request, createResponse)
+      }
+
+      txnCoordinator.handlePrepareTransaction(
+        prepareTxnRequest.data.transactionalId,
+        prepareTxnRequest.data.producerId,
+        prepareTxnRequest.data.producerEpoch,
+        sendResponseCallback,
+        requestLocal)
+    } else
+      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =>
+        new EndTxnResponse(new EndTxnResponseData()
+          .setErrorCode(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.code)
+          .setThrottleTimeMs(requestThrottleMs))
       )
   }
 
